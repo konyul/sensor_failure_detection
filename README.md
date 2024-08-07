@@ -41,6 +41,19 @@ pip install -v -e.
 mkdir -p data/nuscenes
 ```
 
+체크포인트 경로
+Download the pretrained weight of the image backbone from [Google Drive](https://drive.google.com/drive/folders/1vNGjBxl__eF5ti-AAsNWFqJG4uBmYsPG?usp=drive_link) and move them to ckpts directory.
+```shell
+sensor_failure_detection
+├─ ckpts
+│  ├─ fcos3d_vovnet_imgbackbone-remapped.pth
+│  └─ nuim_r50.pth
+├─ figures
+├─ projects
+└─ tools
+```
+
+
 훈련 모델 실행 (예시)
 
 ```
