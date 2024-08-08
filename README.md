@@ -17,7 +17,7 @@ docker pull kyparkk/meformer:python3.8_torch1.11.0_cu113
 docker container 생성
 
 ```
-docker run -it --gpus all --shm-size=8g -v ${서버 데이터 경로}:${원하는 경로} -w ${디렉토리 경로} --name ${container 명} kyparkk/meformer:python3.8_torch1.11.0_cu113 /bin/bash
+docker run -it --gpus all --shm-size=512g -v ${서버 데이터 경로}:${원하는 경로} -w ${디렉토리 경로} --name ${container 명} kyparkk/meformer:python3.8_torch1.11.0_cu113 /bin/bash
 ```
 
 docker container 접속
