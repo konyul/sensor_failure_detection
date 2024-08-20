@@ -5,8 +5,9 @@ import numpy as np
 from mmdet3d.core.points import BasePoints, get_points_type
 from mmdet.datasets.pipelines import LoadAnnotations, LoadImageFromFile
 from ..builder import PIPELINES
-
-
+from .data_augment_utils import reduce_LiDAR_beams
+import pickle, os
+import time
 @PIPELINES.register_module()
 class LoadMultiViewImageFromFiles(object):
     """Load multi channel images from a list of separate channel files.
@@ -20,9 +21,34 @@ class LoadMultiViewImageFromFiles(object):
             Defaults to 'unchanged'.
     """
 
-    def __init__(self, to_float32=False, color_type='unchanged'):
+    def __init__(self, to_float32=False, color_type='unchanged',occlusion=False):
         self.to_float32 = to_float32
         self.color_type = color_type
+        self.occlusion = occlusion
+        if self.occlusion:
+            noise_nuscenes_ann_file = 'data/nuscenes/nuscenes_infos_val_with_noise.pkl'
+            noise_data = pickle.load(open(noise_nuscenes_ann_file,'rb'))
+            self.noise_camera_data = noise_data['camera']
+            mask_file = 'Mud_Mask_selected'
+            self.mask_file = mask_file   
+
+    def pad(self, img):
+        # to pad the 5 input images into a same size (for Waymo)
+        if img.shape[0] != self.img_scale[0]:
+            img = np.concatenate([img, np.zeros_like(img[0:1280-886,:])], axis=0)
+        return img
+    
+    
+    def put_mask_on_img(self, img, mask):
+        h, w = img.shape[:2]
+        mask = np.rot90(mask)
+        mask = mmcv.imresize(mask, (w, h), return_scale=False)
+        alpha = mask / 255
+        alpha = np.power(alpha, 3)
+        img_with_mask = alpha * img + (1 - alpha) * mask
+
+        return img_with_mask
+
 
     def __call__(self, results):
         """Call function to load multi-view image from files.
@@ -44,8 +70,22 @@ class LoadMultiViewImageFromFiles(object):
         """
         filename = results['img_filename']
         # img is of shape (h, w, c, num_views)
-        img = np.stack(
-            [mmcv.imread(name, self.color_type) for name in filename], axis=-1)
+
+        if self.occlusion:
+            img_lists=[]
+            for name in filename:
+                single_img = mmcv.imread(name, self.color_type)
+                
+                noise_index = name.split('/')[-1]
+                mask_id_png = 'mask_'+ str(self.noise_camera_data[noise_index]['noise']['mask_noise']['mask_id']) + '.jpg'
+                mask_name = os.path.join(self.mask_file, mask_id_png)
+                mask = mmcv.imread(mask_name, self.color_type)
+                single_img = self.put_mask_on_img(single_img, mask)
+                img_lists.append(single_img)
+            img = np.stack(img_lists,axis=-1)
+        else:
+            img = np.stack(
+                [mmcv.imread(name, self.color_type) for name in filename], axis=-1)
         if self.to_float32:
             img = img.astype(np.float32)
         results['filename'] = filename
@@ -131,7 +171,11 @@ class LoadPointsFromMultiSweeps(object):
                  file_client_args=dict(backend='disk'),
                  pad_empty_sweeps=False,
                  remove_close=False,
-                 test_mode=False):
+                 test_mode=False,
+                 reduce_beams = False,
+                 limited_fov = False,
+
+                 ):
         self.load_dim = load_dim
         self.sweeps_num = sweeps_num
         self.use_dim = use_dim
@@ -143,8 +187,13 @@ class LoadPointsFromMultiSweeps(object):
         self.pad_empty_sweeps = pad_empty_sweeps
         self.remove_close = remove_close
         self.test_mode = test_mode
+        self.reduce_beams =reduce_beams
+        self.limited_fov = limited_fov
         assert max(use_dim) < load_dim, \
             f'Expect all used dimensions < {load_dim}, got {use_dim}'
+        
+        if self.limited_fov:
+            self.point_cloud_angle_range = [-60,60]
 
     def _load_points(self, pts_filename):
         """Private function to load point clouds data.
@@ -189,6 +238,25 @@ class LoadPointsFromMultiSweeps(object):
         y_filt = np.abs(points_numpy[:, 1]) < radius
         not_close = np.logical_not(np.logical_and(x_filt, y_filt))
         return points[not_close]
+    
+    def filter_point_by_angle(self, points):
+        if isinstance(points,np.ndarray):
+            points_numpy = points
+        elif isinstance(points,BasePoints):
+            points_numpy = points.tensor.numpy()
+        else:
+            raise NotImplementedError
+        
+        pts_phi = (np.arctan(points_numpy[:, 0] / points_numpy[:, 1]) + (points_numpy[:, 1] < 0) * np.pi + np.pi * 2) % (np.pi * 2)
+
+        pts_phi[pts_phi>np.pi] -=np.pi*2
+        pts_phi = pts_phi/np.pi*180
+
+        assert np.all(-180 <= pts_phi) and np.all(pts_phi <= 180)
+
+        filt = np.logical_and(pts_phi>=self.point_cloud_angle_range[0], pts_phi<=self.point_cloud_angle_range[1])
+
+        return points[filt]
 
     def __call__(self, results):
         """Call function to load multi-sweep point clouds from files.
@@ -226,6 +294,11 @@ class LoadPointsFromMultiSweeps(object):
                 sweep = results['sweeps'][idx]
                 points_sweep = self._load_points(sweep['data_path'])
                 points_sweep = np.copy(points_sweep).reshape(-1, self.load_dim)
+
+                if self.reduce_beams:
+                    self.reduce_beams = 4
+                    points_sweep = reduce_LiDAR_beams(points_sweep,self.reduce_beams)
+
                 if self.remove_close:
                     points_sweep = self._remove_close(points_sweep)
                 sweep_ts = sweep['timestamp'] / 1e6
@@ -237,7 +310,12 @@ class LoadPointsFromMultiSweeps(object):
                 sweep_points_list.append(points_sweep)
 
         points = points.cat(sweep_points_list)
-        points = points[:, self.use_dim]
+        
+
+        if self.limited_fov:
+            points = self.filter_point_by_angle(points)
+
+        points= points[:,self.use_dim]
         results['points'] = points
         return results
 
@@ -374,6 +452,7 @@ class LoadPointsFromFile(object):
                  load_dim=6,
                  use_dim=[0, 1, 2],
                  shift_height=False,
+                 reduce_beams =False,
                  use_color=False,
                  file_client_args=dict(backend='disk')):
         self.shift_height = shift_height
@@ -389,7 +468,7 @@ class LoadPointsFromFile(object):
         self.use_dim = use_dim
         self.file_client_args = file_client_args.copy()
         self.file_client = None
-
+        self.reduce_beams = reduce_beams
     def _load_points(self, pts_filename):
         """Private function to load point clouds data.
 
@@ -428,6 +507,11 @@ class LoadPointsFromFile(object):
         pts_filename = results['pts_filename']
         points = self._load_points(pts_filename)
         points = points.reshape(-1, self.load_dim)
+        #
+        if self.reduce_beams:
+            self.reduce_beams = 4
+            points = reduce_LiDAR_beams(points, self.reduce_beams)
+        #
         points = points[:, self.use_dim]
         attribute_dims = None
 
@@ -552,6 +636,7 @@ class LoadAnnotations3D(LoadAnnotations):
         Returns:
             dict: The dict containing loaded 3D bounding box annotations.
         """
+      
         results['gt_bboxes_3d'] = results['ann_info']['gt_bboxes_3d']
         results['bbox3d_fields'].append('gt_bboxes_3d')
         return results

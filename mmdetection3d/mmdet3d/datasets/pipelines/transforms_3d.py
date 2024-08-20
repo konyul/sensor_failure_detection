@@ -67,6 +67,44 @@ class RandomDropPointsColor(object):
 
 
 @PIPELINES.register_module()
+class Randomdropforeground(object):
+    def __init__(self, object_failure):
+        self.object_failure = object_failure
+        self.drop_rate = 0.5
+        print('drop foreground points, ' , self.object_failure)
+
+    @staticmethod
+    def remove_points_in_boxes(points, boxes):
+        """Remove the points in the sampled bounding boxes.
+        Args:
+            points (np.ndarray): Input point cloud array.
+            boxes (np.ndarray): Sampled ground truth boxes.
+        Returns:
+            np.ndarray: Points with those in the boxes removed.
+        """
+        masks = box_np_ops.points_in_rbbox(points.coord.numpy(), boxes)
+        points = points[np.logical_not(masks.any(-1))]
+        return points
+
+    def __call__(self, input_dict):
+        if not self.object_failure:
+            return input_dict
+        
+        gt_bboxes_3d = input_dict['gt_bboxes_3d']
+        points = input_dict['points']
+        if np.random.rand() <self.drop_rate:
+            points = self.remove_points_in_boxes(points, gt_bboxes_3d.tensor.numpy())
+        input_dict['points'] = points
+
+        return input_dict
+
+    def __repr__(self):
+        """str: Return a string that describes the module."""
+        repr_str = self.__class__.__name__
+        repr_str += ' fore_drop_rate={})'.format(self.drop_rate)
+        return repr_str
+
+@PIPELINES.register_module()
 class RandomFlip3D(RandomFlip):
     """Flip the points & bbox.
 
