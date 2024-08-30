@@ -8,93 +8,82 @@ from ..builder import PIPELINES
 from .data_augment_utils import reduce_LiDAR_beams
 import pickle, os
 import time
+import cv2
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+
+
 @PIPELINES.register_module()
-class LoadMultiViewImageFromFiles(object):
-    """Load multi channel images from a list of separate channel files.
-
-    Expects results['img_filename'] to be a list of filenames.
-
-    Args:
-        to_float32 (bool, optional): Whether to convert the img to float32.
-            Defaults to False.
-        color_type (str, optional): Color type of the file.
-            Defaults to 'unchanged'.
-    """
-
-    def __init__(self, to_float32=False, color_type='unchanged',occlusion=False):
+class LoadMultiViewImageFromFiles:
+    def __init__(self, to_float32=False, color_type='unchanged', occlusion=False, num_workers=4):
         self.to_float32 = to_float32
         self.color_type = color_type
         self.occlusion = occlusion
+        self.num_workers = num_workers
         if self.occlusion:
             noise_nuscenes_ann_file = 'data/nuscenes/nuscenes_infos_val_with_noise.pkl'
-            noise_data = pickle.load(open(noise_nuscenes_ann_file,'rb'))
+            with open(noise_nuscenes_ann_file, 'rb') as f:
+                noise_data = pickle.load(f)
             self.noise_camera_data = noise_data['camera']
-            mask_file = 'Mud_Mask_selected'
-            self.mask_file = mask_file   
-
-    def pad(self, img):
-        # to pad the 5 input images into a same size (for Waymo)
-        if img.shape[0] != self.img_scale[0]:
-            img = np.concatenate([img, np.zeros_like(img[0:1280-886,:])], axis=0)
+            self.mask_file = 'Mud_Mask_selected'
+        self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
+    
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def pad(img, img_scale):
+        if img.shape[0] != img_scale[0]:
+            return np.concatenate([img, np.zeros_like(img[0:1280-886,:])], axis=0)
         return img
     
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def load_and_preprocess_mask(mask_path, target_size):
+        mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        mask = cv2.rotate(mask, cv2.ROTATE_90_CLOCKWISE)
+        mask = cv2.resize(mask, target_size, interpolation=cv2.INTER_LINEAR)
+        if len(mask.shape) == 2:
+            mask = np.stack([mask, mask, mask], axis=-1)
+        alpha = np.power(mask.astype(np.float32) / 255.0, 3)
+        return alpha, mask
     
-    def put_mask_on_img(self, img, mask):
-        h, w = img.shape[:2]
-        mask = np.rot90(mask)
-        mask = mmcv.imresize(mask, (w, h), return_scale=False)
-        alpha = mask / 255
-        alpha = np.power(alpha, 3)
-        img_with_mask = alpha * img + (1 - alpha) * mask
-
-        return img_with_mask
-
-
-    def __call__(self, results):
-        """Call function to load multi-view image from files.
-
-        Args:
-            results (dict): Result dict containing multi-view image filenames.
-
-        Returns:
-            dict: The result dict containing the multi-view image data.
-                Added keys and values are described below.
-
-                - filename (str): Multi-view image filenames.
-                - img (np.ndarray): Multi-view image arrays.
-                - img_shape (tuple[int]): Shape of multi-view image arrays.
-                - ori_shape (tuple[int]): Shape of original image arrays.
-                - pad_shape (tuple[int]): Shape of padded image arrays.
-                - scale_factor (float): Scale factor.
-                - img_norm_cfg (dict): Normalization configuration of images.
-        """
-        filename = results['img_filename']
-        # img is of shape (h, w, c, num_views)
-
+    def process_single_image(self, args):
+        name, _ = args
+        single_img = cv2.imread(name, cv2.IMREAD_UNCHANGED)
+        
         if self.occlusion:
-            img_lists=[]
-            for name in filename:
-                single_img = mmcv.imread(name, self.color_type)
-                
-                noise_index = name.split('/')[-1]
-                mask_id_png = 'mask_'+ str(self.noise_camera_data[noise_index]['noise']['mask_noise']['mask_id']) + '.jpg'
-                mask_name = os.path.join(self.mask_file, mask_id_png)
-                mask = mmcv.imread(mask_name, self.color_type)
-                single_img = self.put_mask_on_img(single_img, mask)
-                img_lists.append(single_img)
-            img = np.stack(img_lists,axis=-1)
-        else:
-            img = np.stack(
-                [mmcv.imread(name, self.color_type) for name in filename], axis=-1)
+            noise_index = os.path.basename(name)
+            mask_id_png = f"mask_{self.noise_camera_data[noise_index]['noise']['mask_noise']['mask_id']}.jpg"
+            mask_name = os.path.join(self.mask_file, mask_id_png)
+            
+            h, w = single_img.shape[:2]
+            alpha, mask = self.load_and_preprocess_mask(mask_name, (w, h))
+            
+            if len(single_img.shape) == 2:
+                single_img = np.stack([single_img, single_img, single_img], axis=-1)
+            elif single_img.shape[2] == 1:
+                single_img = np.repeat(single_img, 3, axis=2)
+            
+            if len(alpha.shape) == 2:
+                alpha = np.expand_dims(alpha, axis=-1)
+            
+            single_img = (alpha * single_img + (1 - alpha) * mask).astype(np.uint8)
+        
+        return single_img
+    
+    def __call__(self, results):
+        filename = results['img_filename']
+        
+        img_list = list(self.executor.map(self.process_single_image, zip(filename, range(len(filename)))))
+        
+        img = np.stack(img_list, axis=-1)
+        
         if self.to_float32:
             img = img.astype(np.float32)
+        
         results['filename'] = filename
-        # unravel to list, see `DefaultFormatBundle` in formatting.py
-        # which will transpose each image separately and then stack into array
         results['img'] = [img[..., i] for i in range(img.shape[-1])]
         results['img_shape'] = img.shape
         results['ori_shape'] = img.shape
-        # Set initial values for default meta_keys
         results['pad_shape'] = img.shape
         results['scale_factor'] = 1.0
         num_channels = 1 if len(img.shape) < 3 else img.shape[2]
@@ -102,16 +91,114 @@ class LoadMultiViewImageFromFiles(object):
             mean=np.zeros(num_channels, dtype=np.float32),
             std=np.ones(num_channels, dtype=np.float32),
             to_rgb=False)
+        
         return results
 
     def __repr__(self):
-        """str: Return a string that describes the module."""
-        repr_str = self.__class__.__name__
-        repr_str += f'(to_float32={self.to_float32}, '
-        repr_str += f"color_type='{self.color_type}')"
-        return repr_str
+        return f'{self.__class__.__name__}(to_float32={self.to_float32}, color_type=\'{self.color_type}\')'
+
+# @PIPELINES.register_module()
+# class LoadMultiViewImageFromFiles(object):
+#     """Load multi channel images from a list of separate channel files.
+
+#     Expects results['img_filename'] to be a list of filenames.
+
+#     Args:
+#         to_float32 (bool, optional): Whether to convert the img to float32.
+#             Defaults to False.
+#         color_type (str, optional): Color type of the file.
+#             Defaults to 'unchanged'.
+#     """
+
+#     def __init__(self, to_float32=False, color_type='unchanged',occlusion=False):
+#         self.to_float32 = to_float32
+#         self.color_type = color_type
+#         self.occlusion = occlusion
+#         if self.occlusion:
+#             noise_nuscenes_ann_file = 'data/nuscenes/nuscenes_infos_val_with_noise.pkl'
+#             noise_data = pickle.load(open(noise_nuscenes_ann_file,'rb'))
+#             self.noise_camera_data = noise_data['camera']
+#             mask_file = 'Mud_Mask_selected'
+#             self.mask_file = mask_file   
+
+#     def pad(self, img):
+#         # to pad the 5 input images into a same size (for Waymo)
+#         if img.shape[0] != self.img_scale[0]:
+#             img = np.concatenate([img, np.zeros_like(img[0:1280-886,:])], axis=0)
+#         return img
+    
+    
+#     def put_mask_on_img(self, img, mask):
+#         h, w = img.shape[:2]
+#         mask = np.rot90(mask)
+#         mask = mmcv.imresize(mask, (w, h), return_scale=False)
+#         alpha = mask / 255
+#         alpha = np.power(alpha, 3)
+#         img_with_mask = alpha * img + (1 - alpha) * mask
+
+#         return img_with_mask
 
 
+#     def __call__(self, results):
+#         """Call function to load multi-view image from files.
+
+#         Args:
+#             results (dict): Result dict containing multi-view image filenames.
+
+#         Returns:
+#             dict: The result dict containing the multi-view image data.
+#                 Added keys and values are described below.
+
+#                 - filename (str): Multi-view image filenames.
+#                 - img (np.ndarray): Multi-view image arrays.
+#                 - img_shape (tuple[int]): Shape of multi-view image arrays.
+#                 - ori_shape (tuple[int]): Shape of original image arrays.
+#                 - pad_shape (tuple[int]): Shape of padded image arrays.
+#                 - scale_factor (float): Scale factor.
+#                 - img_norm_cfg (dict): Normalization configuration of images.
+#         """
+#         filename = results['img_filename']
+#         # img is of shape (h, w, c, num_views)
+
+#         if self.occlusion:
+#             img_lists=[]
+#             for name in filename:
+#                 single_img = mmcv.imread(name, self.color_type)
+                
+#                 noise_index = name.split('/')[-1]
+#                 mask_id_png = 'mask_'+ str(self.noise_camera_data[noise_index]['noise']['mask_noise']['mask_id']) + '.jpg'
+#                 mask_name = os.path.join(self.mask_file, mask_id_png)
+#                 mask = mmcv.imread(mask_name, self.color_type)
+#                 single_img = self.put_mask_on_img(single_img, mask)
+#                 img_lists.append(single_img)
+#             img = np.stack(img_lists,axis=-1)
+#         else:
+#             img = np.stack(
+#                 [mmcv.imread(name, self.color_type) for name in filename], axis=-1)
+#         if self.to_float32:
+#             img = img.astype(np.float32)
+#         results['filename'] = filename
+#         # unravel to list, see `DefaultFormatBundle` in formatting.py
+#         # which will transpose each image separately and then stack into array
+#         results['img'] = [img[..., i] for i in range(img.shape[-1])]
+#         results['img_shape'] = img.shape
+#         results['ori_shape'] = img.shape
+#         # Set initial values for default meta_keys
+#         results['pad_shape'] = img.shape
+#         results['scale_factor'] = 1.0
+#         num_channels = 1 if len(img.shape) < 3 else img.shape[2]
+#         results['img_norm_cfg'] = dict(
+#             mean=np.zeros(num_channels, dtype=np.float32),
+#             std=np.ones(num_channels, dtype=np.float32),
+#             to_rgb=False)
+#         return results
+
+#     def __repr__(self):
+#         """str: Return a string that describes the module."""
+#         repr_str = self.__class__.__name__
+#         repr_str += f'(to_float32={self.to_float32}, '
+#         repr_str += f"color_type='{self.color_type}')"
+#         return repr_str
 @PIPELINES.register_module()
 class LoadImageFromFileMono3D(LoadImageFromFile):
     """Load an image from file in monocular 3D object detection. Compared to 2D

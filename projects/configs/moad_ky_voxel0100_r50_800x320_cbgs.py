@@ -102,6 +102,7 @@ train_pipeline = [
     dict(type='ResizeCropFlipImage', data_aug_conf=ida_aug_conf, training=True),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='PadMultiViewImage', size_divisor=32),
+    dict(type='RandomMaskInput', point_cloud_range=point_cloud_range, voxel_size=voxel_size, masking_ratio=0.5, masking_frequency=0.25),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
     dict(type='Collect3D', keys=['points', 'img', 'gt_bboxes_3d', 'gt_labels_3d'],
          meta_keys=('filename', 'ori_shape', 'img_shape', 'lidar2img',
@@ -111,7 +112,7 @@ train_pipeline = [
                     'img_norm_cfg', 'pcd_trans', 'sample_idx',
                     'pcd_scale_factor', 'pcd_rotation', 'pts_filename',
                     'transformation_3d_flow', 'rot_degree',
-                    'gt_bboxes_3d', 'gt_labels_3d'))
+                    'gt_bboxes_3d', 'gt_labels_3d', 'point_mask'))
 ]
 test_pipeline = [
     dict(
@@ -119,13 +120,11 @@ test_pipeline = [
         coord_type='LIDAR',
         load_dim=5,
         use_dim=[0, 1, 2, 3, 4],
-        reduce_beams = True
     ),
     dict(
         type='LoadPointsFromMultiSweeps',
         sweeps_num=10,
         use_dim=[0, 1, 2, 3, 4],
-        reduce_beams = True
     ),
     dict(type='LoadMultiViewImageFromFiles'),
     dict(
@@ -159,7 +158,7 @@ data = dict(
             type=dataset_type,
             data_root=data_root,
             ann_file=data_root + '/nuscenes_infos_train.pkl',
-            load_interval=1,
+            load_interval=5,
             pipeline=train_pipeline,
             classes=class_names,
             modality=input_modality,
@@ -196,7 +195,7 @@ model = dict(
         frozen_stages=-1,
         norm_cfg=dict(type='BN', requires_grad=True),
         norm_eval=True,
-        with_cp=True,
+        with_cp=False,
         style='pytorch'),
     img_neck=dict(
         type='CPFPN',
@@ -246,7 +245,7 @@ model = dict(
         pc_range=point_cloud_range,
         modalities=dict(
             train=["fused", "bev", "img"],
-            test=["fused", "bev", "img"]
+            test=["fused"]
         ),
         common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
         tasks=[
@@ -261,8 +260,7 @@ model = dict(
             type='MultiTaskBBoxCoder',
             post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
             pc_range=point_cloud_range,
-            #max_num=300,
-            max_num=2700,
+            max_num=300,
             voxel_size=voxel_size,
             num_classes=10),
         separate_head=dict(
@@ -303,7 +301,8 @@ model = dict(
             ),
         ),
         loss_cls=dict(type='FocalLoss', use_sigmoid=True, gamma=2, alpha=0.25, reduction='mean', loss_weight=2.0),
-        loss_bbox=dict(type='L1Loss', reduction='mean', loss_weight=0.25)
+        loss_bbox=dict(type='L1Loss', reduction='mean', loss_weight=0.25),
+        failure_pred=True
     ),
     train_cfg=dict(
         pts=dict(
@@ -349,7 +348,6 @@ optimizer_config = dict(
     type='CustomFp16OptimizerHook',
     loss_scale='dynamic',
     grad_clip=dict(max_norm=35, norm_type=2),
-    #cumulative_iters=2,
     custom_fp16=dict(pts_voxel_encoder=False, pts_middle_encoder=False, pts_bbox_head=False))
 
 lr_config = dict(
@@ -384,3 +382,4 @@ custom_hooks = [
         drop_epoch=15
     )
 ]
+find_unused_parameters=True

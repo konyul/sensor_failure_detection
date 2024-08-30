@@ -13,7 +13,7 @@ from mmcv.utils import build_from_cfg
 from mmdet.datasets.builder import PIPELINES
 from mmdet3d.core.bbox import box_np_ops
 from mmdet3d.datasets.builder import OBJECTSAMPLERS
-
+import matplotlib.pyplot as plt
 
 @PIPELINES.register_module()
 class PadMultiViewImage(object):
@@ -967,3 +967,114 @@ class GlobalRotScaleTransImage(object):
             results["lidar2img"][view] = (torch.tensor(results["lidar2img"][view]).float() @ mat.float()).numpy()
             results["lidar2cam"][view] = (torch.tensor(results["lidar2cam"][view]).float() @ mat.float()).numpy()
         return
+
+
+@PIPELINES.register_module()
+class RandomMaskInput(object):
+
+    def __init__(self, mode='train', mask_modal='image', masking_ratio=0.5, masking_frequency=0.25, **kwargs):
+        super(RandomMaskInput, self).__init__()
+        self.pc_range = kwargs['point_cloud_range']
+        self.voxel_size = kwargs['voxel_size']
+        self.masking_ratio = masking_ratio
+        self.mode = mode
+        self.mask_modal = mask_modal
+        self.masking_frequency = masking_frequency
+    
+    def create_masks(self, bev_range, mask_size_range=(1, 19)):
+        bev_size = bev_range[1] - bev_range[0]
+        total_area = bev_size ** 2
+        target_area = self.masking_ratio * total_area
+        
+        masks = []
+        current_area = 0
+        
+        while current_area < target_area:
+            # Sample random position
+            sample_x = torch.rand(1) * (bev_range[1] - bev_range[0]) + bev_range[0]
+            sample_y = torch.rand(1) * (bev_range[1] - bev_range[0]) + bev_range[0]
+            
+            # Generate random square mask size
+            mask_size = torch.rand(1) * (mask_size_range[1] - mask_size_range[0]) + mask_size_range[0]
+            
+            # Define mask boundaries
+            x_min, x_max = sample_x - mask_size/2, sample_x + mask_size/2
+            y_min, y_max = sample_y - mask_size/2, sample_y + mask_size/2
+            
+            # Clip the mask to be within BEV range
+            x_min = torch.clamp(x_min, min=bev_range[0])
+            x_max = torch.clamp(x_max, max=bev_range[1])
+            y_min = torch.clamp(y_min, min=bev_range[0])
+            y_max = torch.clamp(y_max, max=bev_range[1])
+            
+            # Calculate actual mask size after clipping
+            actual_size_x = x_max - x_min
+            actual_size_y = y_max - y_min
+            
+            masks.append((x_min.item(), x_max.item(), y_min.item(), y_max.item()))
+            current_area += actual_size_x * actual_size_y
+        
+        return masks
+        
+    def sample_points_with_masks(self, points, bev_range=(-54, 54), mask_size_range=(1, 19), height=(-5, 3)):
+
+        # Create masks covering 50% of BEV
+        masks = self.create_masks(bev_range, mask_size_range)
+        combined_mask = torch.zeros(points.shape[0], dtype=torch.bool)
+        for mask in masks:
+            x_min, x_max, y_min, y_max = mask
+            mask_condition = (
+                (points[:, 0] >= x_min) & (points[:, 0] <= x_max) &
+                (points[:, 1] >= y_min) & (points[:, 1] <= y_max)
+            )
+            combined_mask = torch.logical_or(combined_mask, mask_condition)
+
+        # Apply the combined mask to get all sampled points at once
+        filtered_points = points[~combined_mask]
+        return filtered_points, masks
+
+    def visualize_bev(self, points_before, points_after, masks, bev_range, filename):
+        plt.figure(figsize=(24, 12))
+        
+        # Before filtering
+        plt.subplot(121)
+        plt.scatter(points_before[:, 0], -points_before[:, 1], s=0.1, alpha=0.5)
+        plt.title("Before Filtering")
+        plt.xlim(bev_range)
+        plt.ylim(bev_range)
+        plt.gca().set_aspect('equal', adjustable='box')
+        
+        # After filtering
+        plt.subplot(122)
+        plt.scatter(points_after[:, 0], -points_after[:, 1], s=0.1, alpha=0.5)
+        for mask in masks:
+            x_min, x_max, y_min, y_max = mask
+            plt.gca().add_patch(plt.Rectangle((x_min, -y_max), x_max - x_min, y_max - y_min, 
+                                            fill=True, facecolor='red', alpha=0.3, edgecolor='r'))
+        plt.title("After Filtering")
+        plt.xlim(bev_range)
+        plt.ylim(bev_range)
+        plt.gca().set_aspect('equal', adjustable='box')
+        
+        plt.tight_layout()
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def __call__(self, input_dict):
+        if self.mode == 'train':
+            if torch.rand(1).item() < self.masking_frequency:
+                points = input_dict['points'].tensor
+                sampled_points, masks = self.sample_points_with_masks(points, bev_range=(self.pc_range[0], self.pc_range[3]), height=(self.pc_range[2], self.pc_range[5]))
+                bev_range = (self.pc_range[0], self.pc_range[3])
+                input_dict['point_mask'] = masks
+                input_dict['points'].tensor = sampled_points
+                if False:
+                    self.visualize_bev(points, sampled_points, masks, bev_range, "bev_visualization_.png")
+            else:
+                input_dict['point_mask'] = False
+        return input_dict
+
+    def __repr__(self):
+        """str: Return a string that describes the module."""
+        repr_str = self.__class__.__name__
+        return repr_str

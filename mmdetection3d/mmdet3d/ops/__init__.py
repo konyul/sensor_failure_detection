@@ -28,7 +28,7 @@ from .pointnet_modules import (PAConvCUDASAModule, PAConvCUDASAModuleMSG,
                                build_sa_module)
 from .sparse_block import (SparseBasicBlock, SparseBottleneck,
                            make_sparse_convmodule)
-
+from .iou3d_nms import *
 __all__ = [
     'nms', 'soft_nms', 'RoIAlign', 'roi_align', 'get_compiler_version',
     'get_compiling_cuda_version', 'NaiveSyncBatchNorm1d',

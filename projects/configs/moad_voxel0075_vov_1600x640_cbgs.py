@@ -241,7 +241,8 @@ model = dict(
         pc_range=point_cloud_range,
         modalities=dict(
             train=["fused", "bev", "img"],
-            test=["fused"]
+            #test=["fused"]
+            test=["fused", "bev", "img"],
         ),
         common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
         tasks=[
@@ -256,7 +257,7 @@ model = dict(
             type='MultiTaskBBoxCoder',
             post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
             pc_range=point_cloud_range,
-            max_num=300,
+            max_num=2700,
             voxel_size=voxel_size,
             num_classes=10),
         separate_head=dict(
