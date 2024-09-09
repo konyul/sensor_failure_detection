@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mmdet3d.core.utils.center_utils import _transpose_and_gather_feat, \
   bbox3d_overlaps_iou, bbox3d_overlaps_giou, bbox3d_overlaps_diou
-from mmdet3d.ops.iou3d_nms.iou3d_nms_utils import boxes_aligned_iou3d_gpu
+from mmdet3d.ops.iou3d_nms.iou3d_nms_utils import boxes_aligned_iou3d_gpu ,boxes_iou_bev
 
 class RegLoss(nn.Module):
   '''Regression loss for an output tensor
@@ -70,18 +70,23 @@ class IouLoss(nn.Module):
   def __init__(self):
     super(IouLoss, self).__init__()
 
+  def _sigmoid(self, x):
+        y = torch.clamp(x.sigmoid_(), min=1e-4, max=1-1e-4)
+        return y
+
   def forward(self, iou_pred, box_pred, box_gt,num_total_pos):
-    # if mask.sum() == 0:
-    #   return iou_pred.new_zeros((1))
-    # mask = mask.bool()
-    # pred = _transpose_and_gather_feat(iou_pred, ind)[mask]
-    # pred_box = _transpose_and_gather_feat(box_pred, ind)
+    
     #import pdb; pdb.set_trace()
-    target = boxes_aligned_iou3d_gpu(box_pred[:,:7], box_gt[:,:7])
-    target = 2 * target - 1
-    #import pdb; pdb.set_trace()
-    loss = F.l1_loss(iou_pred, target, reduction='sum')
-    loss = loss / (num_total_pos + 1e-4)
+    target = boxes_iou_bev(box_pred[:,:7],box_gt[:,:7])
+    target = target.max(1)[0]
+    
+    iou_pred= self._sigmoid(iou_pred)
+    #target = (target-0.5)/0.5
+    loss = F.smooth_l1_loss(iou_pred.squeeze(), target.squeeze(), reduction='mean')
+    loss = 5* loss
+    
+    #loss = F.l1_loss(iou_pred.squeeze(), target.squeeze(), reduction='sum')
+    #loss = loss / (num_total_pos + 1e-4)
     return loss
 
 class IouRegLoss(nn.Module):

@@ -12,7 +12,12 @@ from mmdet.core.bbox.builder import BBOX_CODERS
 from projects.mmdet3d_plugin.core.bbox.util import denormalize_bbox
 
 from mmcv.ops import nms as nms_mmcv
-from mmdet3d.core.evaluation import bbox_overlaps
+from mmdet3d.core.post_processing import nms_bev
+from mmdet3d.core import xywhr2xyxyr
+from mmdet3d.core.bbox.iou_calculators import bbox_overlaps_3d
+from mmcv.ops import boxes_overlap_bev
+from mmdet3d.ops.iou3d_nms.iou3d_nms_utils import boxes_iou_bev , nms_gpu , boxes_aligned_iou3d_gpu
+# from mmdet3d.core.evaluation import bbox_overlaps
 @BBOX_CODERS.register_module()
 class MultiTaskBBoxCoder_iou(BaseBBoxCoder):
     """Bbox coder for NMS-free detector.
@@ -45,60 +50,48 @@ class MultiTaskBBoxCoder_iou(BaseBBoxCoder):
         pass
 
     def iou_nms(self, bboxes, scores, locs, iou_threshold):
-        """
-        Use localization score to guide NMS. Bboxes are sorted by locs, the final score is
-        taking the max of scores of all suppressed bboxes.
-        """
-        import pdb;pdb.set_trace()
-        _, keep = nms_mmcv(bboxes, locs, iou_threshold)
+
+        bev_bboxes = bboxes[:,:7]
+        keep  = nms_gpu(bev_bboxes,locs.squeeze(),iou_threshold)
         keep_bboxes = bboxes[keep]
-        overlaps = bbox_overlaps(keep_bboxes, bboxes)
-        # find the suppressed bboxes for each kept bbox
+
+        overlaps = bbox_overlaps_3d(keep_bboxes, bboxes, coordinate='lidar')
+
         suppressed = overlaps > iou_threshold
-        # accumulate suppression count
         suppressed = suppressed.long().cummax(0)[0].cumsum(0)
-        # the real suppressed bboxes should be the ones that are suppressed exactly once
         suppressed = (suppressed == 1)
+
+        scores =  scores * locs
         span_scores = scores.view(1, overlaps.size(1)).repeat(overlaps.size(0), 1)
         span_scores[~suppressed] = scores.min() - 1
-        # taking the max of the suppressed group
+
         keep_scores = span_scores.max(1)[0]
-        # sort by scores, following tradition
         keep_scores, srt_idx = keep_scores.sort(descending=True)
+
         return keep[srt_idx], keep_scores
 
 
-    def batched_iou_nms(self, bboxes, scores, locs, labels, iou_threshold, guide='rank'):
-        """IoU guided NMS.
+    def batched_iou_nms(self, bboxes, scores, locs, labels, iou_threshold, gt_bboxes_3d, guide='none'):
         
-        Args:
-            bboxes (Tensor): shape (n, 4)
-            scores (Tensor): shape (n,), classification score
-            locs (Tensor): shape(n,) localization score/iou score
-            labels (Tensor): label of bboxes, help to do batched nms
-            iou_threshold (float): iou threshold
-            score_thr (float): filter scores belowing this number
-            guide (str): decide how to use iou score to guide nms, 
-                supported key words: none, rank, weight"""
+        locs_extra = locs.squeeze()
         
-        nms_bboxes = bboxes + (labels * (bboxes.max() + 1)).view(-1, 1)
-        # 'rank' is the official iou guided nms
+        # if len(gt_bboxes_3d[0][0]) == 0:
+        #     locs = torch.zeros(locs.shape).cuda()
+        #     locs = locs.squeeze(1)
+        # else:
+        #     boxes_iou = boxes_iou_bev(bboxes[:,:7], gt_bboxes_3d[0][0].tensor[:,:7].cuda())
+        #     #boxes_3d_iou = boxes_aligned_iou3d_gpu(bboxes[:,:7], gt_bboxes_3d[0][0].tensor[:,:7].cuda())
+        #     locs = boxes_iou.max(1)[0]
+        # import pdb; pdb.set_trace()
+        nms_bboxes = bboxes
+
         if guide == 'rank':
-            keep, keep_scores = self.iou_nms(nms_bboxes, scores, locs, iou_threshold)
-            return bboxes[keep], keep_scores, locs[keep], labels[keep]
-        # use the product of cls_score * iou_score as the nms_locs
-        elif guide == 'weight':
-            nms_locs = scores * locs
-            keep, keep_scores = self.iou_nms(nms_bboxes, scores, nms_locs, iou_threshold)
-            return bboxes[keep], keep_scores, locs[keep], labels[keep]
-        # do not utilize iou_score in nms
-        elif guide == 'none':
-            _, keep = nms_mmcv(nms_bboxes, scores, iou_threshold)
-            return bboxes[keep], scores[keep], locs[keep], labels[keep]
+             keep, keep_scores = self.iou_nms(nms_bboxes, scores, locs_extra, iou_threshold)
+             return bboxes[keep], keep_scores, locs[keep], labels[keep]
         else:
             raise RuntimeError('guide type not supported: {}'.format(guide))
 
-    def decode_single(self, cls_scores, bbox_preds, iou_pred, task_ids):
+    def decode_single(self, cls_scores, bbox_preds, iou_pred, task_ids, bbox_targets_lists):
         """Decode bboxes.
         Args:
             cls_scores (Tensor): Outputs from the classification head, \
@@ -112,13 +105,12 @@ class MultiTaskBBoxCoder_iou(BaseBBoxCoder):
         """
         max_num = self.max_num
         num_query = cls_scores.shape[0]
-
         cls_scores = cls_scores.sigmoid()
         scores, indexs = cls_scores.view(-1).topk(max_num)
         labels = indexs % self.num_classes
         bbox_index = indexs // self.num_classes
         task_index = torch.gather(task_ids, 1, labels.unsqueeze(1)).squeeze()
-
+        iou_pred = iou_pred.sigmoid()
         bbox_preds = bbox_preds[task_index * num_query + bbox_index]
         boxes3d = denormalize_bbox(bbox_preds, self.pc_range)
 
@@ -139,8 +131,12 @@ class MultiTaskBBoxCoder_iou(BaseBBoxCoder):
             scores = scores[mask]
             labels = labels[mask]
             iou_pred = iou_pred[mask]
-            self.batched_iou_nms(boxes3d, scores, iou_pred, labels, iou_threshold, guide='rank')
-
+            iou_preds = torch.clamp(iou_pred, min=0, max=1.) # for this ex, delete pls
+            boxes3d, scores, iou_pred, labels = self.batched_iou_nms(boxes3d, scores, iou_pred, labels, 0.05, bbox_targets_lists, guide='rank')
+            if len(boxes3d) > 300:
+                boxes3d = boxes3d[:300]
+                scores = scores[:300]
+                labels = labels[:300]
         predictions_dict = {
             'bboxes': boxes3d,
             'scores': scores,
@@ -148,7 +144,7 @@ class MultiTaskBBoxCoder_iou(BaseBBoxCoder):
         }
         return predictions_dict
 
-    def decode(self, preds_dicts):
+    def decode(self, preds_dicts, gt_bboxes_3d, gt_labels_3d):
         """Decode bboxes.
         Args:
             all_cls_scores (Tensor): Outputs from the classification head, \
@@ -162,7 +158,7 @@ class MultiTaskBBoxCoder_iou(BaseBBoxCoder):
         """
         task_num = len(preds_dicts)
 
-        pred_bbox_list, pred_logits_list, pred_iou_list, task_ids_list, rv_box_mask_lists = [], [], [], [] , []
+        pred_bbox_list, pred_logits_list, pred_iou_list, task_ids_list, rv_box_mask_lists = [], [], [], [], []
         for task_id in range(task_num):
             task_pred_dict = preds_dicts[task_id][0]
             task_pred_bbox = [task_pred_dict['center'][-1], task_pred_dict['height'][-1],
@@ -193,7 +189,7 @@ class MultiTaskBBoxCoder_iou(BaseBBoxCoder):
         all_pred_iou = torch.cat(pred_iou_list,dim =-1)
         all_task_ids = torch.cat(task_ids_list, dim=-1)  # bs * nq * 10
         all_rv_box_masks = torch.cat(rv_box_mask_lists, dim=-1)
-
+        
         batch_size = all_pred_logits.shape[0]
         predictions_list = []
         for i in range(batch_size):
@@ -209,7 +205,7 @@ class MultiTaskBBoxCoder_iou(BaseBBoxCoder):
             task_ids = all_task_ids[i][box_mask]
 
             predictions_list.append(
-                self.decode_single(pred_logits, pred_bbox, pred_iou, task_ids))
+                self.decode_single(pred_logits, pred_bbox, pred_iou, task_ids, gt_bboxes_3d))
         return predictions_list
 
 

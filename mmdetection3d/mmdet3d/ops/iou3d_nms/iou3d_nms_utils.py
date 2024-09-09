@@ -82,11 +82,7 @@ def boxes_aligned_iou3d_gpu(boxes_a, boxes_b):
     """
     assert boxes_a.shape[0] == boxes_b.shape[0]
     assert boxes_a.shape[1] == boxes_b.shape[1] == 7
-    #import pdb ; pdb.set_trace()
-    # transform back to pcdet's coordinate
-    #boxes_a = to_pcdet(boxes_a)
-    #boxes_b = to_pcdet(boxes_b)
-
+    
     # height overlap
     boxes_a_height_max = (boxes_a[:, 2] + boxes_a[:, 5] / 2).view(-1, 1)
     boxes_a_height_min = (boxes_a[:, 2] - boxes_a[:, 5] / 2).view(-1, 1)
@@ -127,7 +123,7 @@ def nms_gpu(boxes, scores, thresh, pre_maxsize=None, **kwargs):
     boxes = boxes[order].contiguous()
     keep = torch.LongTensor(boxes.size(0))
     num_out = iou3d_nms_cuda.nms_gpu(boxes, keep, thresh)
-    return order[keep[:num_out].cuda()].contiguous(), None
+    return order[keep[:num_out].cuda()].contiguous()
 
 
 def nms_normal_gpu(boxes, scores, thresh, **kwargs):

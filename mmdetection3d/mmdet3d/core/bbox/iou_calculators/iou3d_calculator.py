@@ -130,7 +130,7 @@ def bbox_overlaps_nearest_3d(bboxes1,
     assert bboxes1.size(-1) == bboxes2.size(-1) >= 7
 
     box_type, _ = get_box_type(coordinate)
-
+    
     bboxes1 = box_type(bboxes1, box_dim=bboxes1.shape[-1])
     bboxes2 = box_type(bboxes2, box_dim=bboxes2.shape[-1])
 
@@ -170,6 +170,8 @@ def bbox_overlaps_3d(bboxes1, bboxes2, mode='iou', coordinate='camera'):
 
     box_type, _ = get_box_type(coordinate)
 
+    
+    #import pdb; pdb.set_trace()
     bboxes1 = box_type(bboxes1, box_dim=bboxes1.shape[-1])
     bboxes2 = box_type(bboxes2, box_dim=bboxes2.shape[-1])
 

@@ -244,7 +244,7 @@ model = dict(
         pc_range=point_cloud_range,
         modalities=dict(
             train=["fused", "bev", "img"],
-            test=["fused"]
+            test=["fused", "bev" , "img"]
         ),
         common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
         tasks=[

@@ -86,7 +86,7 @@ test_pipeline = [
         sweeps_num=10,
         use_dim=[0, 1, 2, 3, 4],
         reduce_beams = False,
-        limited_fov = False
+        limited_fov = True
     ),
     dict(type='LoadMultiViewImageFromFiles'),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
@@ -209,7 +209,7 @@ model = dict(
             train=["fused", "bev", "img"],
             test=["fused","bev","img"]
         ),
-        common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2), iou=(1,2)),
+        common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2),iou=(1,2)),
         tasks=[
             dict(num_class=10, class_names=[
                 'car', 'truck', 'construction_vehicle',
@@ -329,7 +329,7 @@ model = dict(
         )))
 optimizer = dict(
     type='AdamW',
-    lr=0.0001,
+    lr=0.0005,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.01, decay_mult=5),
@@ -360,7 +360,7 @@ log_config = dict(
            dict(type='TensorboardLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = 'work_dirs/iou_2stage/res_0100/0909_e2e_b4_lr_0.0001_delete_dn_smoothL1_sigmoid_pred'
+work_dir = 'work_dirs/iou_2stage/vov_0075/0827_resolve_change_lr_mean_debug'
 load_from = 'ckpts/moad_voxel0075_vov_1600x640_cbgs.pth'
 resume_from = None
 workflow = [('train', 1)]

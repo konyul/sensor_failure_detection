@@ -6,9 +6,9 @@ class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
-voxel_size = [0.075, 0.075, 0.2]
+voxel_size = [0.1, 0.1, 0.2]
 out_size_factor = 8
-evaluation = dict(interval=1)
+evaluation = dict(interval=4)
 dataset_type = 'CustomNuScenesDataset'
 data_root = 'data/nuscenes/'
 input_modality = dict(
@@ -22,8 +22,8 @@ img_norm_cfg = dict(
     mean=[103.530, 116.280, 123.675], std=[57.375, 57.120, 58.395], to_rgb=False)
 
 ida_aug_conf = {
-    "resize_lim": (0.94, 1.25),
-    "final_dim": (640, 1600),
+    "resize_lim": (0.47, 0.625),
+    "final_dim": (320, 800),
     "bot_pct_lim": (0.0, 0.0),
     "rot_lim": (0.0, 0.0),
     "H": 900,
@@ -45,6 +45,46 @@ train_pipeline = [
     ),
     dict(type='LoadMultiViewImageFromFiles'),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+    dict(
+        type='UnifiedObjectSample',
+        sample_2d=True,
+        mixup_rate=0.5,
+        db_sampler=dict(
+            type='UnifiedDataBaseSampler',
+            data_root=data_root,
+            info_path=data_root + 'nuscenes_dbinfos_train.pkl',
+            rate=1.0,
+            prepare=dict(
+                filter_by_difficulty=[-1],
+                filter_by_min_points=dict(
+                    car=5,
+                    truck=5,
+                    bus=5,
+                    trailer=5,
+                    construction_vehicle=5,
+                    traffic_cone=5,
+                    barrier=5,
+                    motorcycle=5,
+                    bicycle=5,
+                    pedestrian=5)),
+            classes=class_names,
+            sample_groups=dict(
+                car=2,
+                truck=3,
+                construction_vehicle=7,
+                bus=4,
+                trailer=6,
+                barrier=2,
+                motorcycle=6,
+                bicycle=6,
+                pedestrian=2,
+                traffic_cone=2),
+            points_loader=dict(
+                type='LoadPointsFromFile',
+                coord_type='LIDAR',
+                load_dim=5,
+                use_dim=[0, 1, 2, 3, 4],
+            ))),
     dict(
         type='GlobalRotScaleTransAll',
         rot_range=[-0.3925 * 2, 0.3925 * 2],
@@ -79,14 +119,11 @@ test_pipeline = [
         coord_type='LIDAR',
         load_dim=5,
         use_dim=[0, 1, 2, 3, 4],
-        reduce_beams = False
     ),
     dict(
         type='LoadPointsFromMultiSweeps',
         sweeps_num=10,
         use_dim=[0, 1, 2, 3, 4],
-        reduce_beams = False,
-        limited_fov = False
     ),
     dict(type='LoadMultiViewImageFromFiles'),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
@@ -109,11 +146,11 @@ test_pipeline = [
                 type='DefaultFormatBundle3D',
                 class_names=class_names,
                 with_label=False),
-            dict(type='Collect3D', keys=['points', 'img', 'gt_bboxes_3d', 'gt_labels_3d'])
+            dict(type='Collect3D', keys=['points', 'img','gt_bboxes_3d','gt_labels_3d'])
         ])
 ]
 data = dict(
-    samples_per_gpu=4,
+    samples_per_gpu=2,
     workers_per_gpu=6,
     train=dict(
         type='CBGSDataset',
@@ -121,7 +158,7 @@ data = dict(
             type=dataset_type,
             data_root=data_root,
             ann_file=data_root + '/nuscenes_infos_train.pkl',
-            load_interval=1,
+            load_interval=5,
             pipeline=train_pipeline,
             classes=class_names,
             modality=input_modality,
@@ -151,15 +188,18 @@ model = dict(
     type='MEFormerDetector',
     use_grid_mask=True,
     img_backbone=dict(
-        type='VoVNet',
-        spec_name='V-99-eSE',
-        norm_eval=True,
+        type='ResNet',
+        depth=50,
+        num_stages=4,
+        out_indices=(2, 3),
         frozen_stages=-1,
-        input_ch=3,
-        out_features=('stage4', 'stage5',)),
+        norm_cfg=dict(type='BN', requires_grad=True),
+        norm_eval=True,
+        with_cp=True,
+        style='pytorch'),
     img_neck=dict(
         type='CPFPN',
-        in_channels=[768, 1024],
+        in_channels=[1024, 2048],
         out_channels=256,
         num_outs=2),
     pts_voxel_layer=dict(
@@ -175,7 +215,7 @@ model = dict(
     pts_middle_encoder=dict(
         type='SparseEncoder',
         in_channels=5,
-        sparse_shape=[41, 1440, 1440],
+        sparse_shape=[41, 1024, 1024],
         output_channels=128,
         order=('conv', 'norm', 'act'),
         encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128)),
@@ -198,16 +238,15 @@ model = dict(
         upsample_cfg=dict(type='deconv', bias=False),
         use_conv_for_no_stride=True),
     pts_bbox_head=dict(
-        type='MEFormerHead_iou',
+        type='MEFormerHead',
         in_channels=512,
         hidden_dim=256,
-        iou_reg ='DIoU',
+        iou_reg='DIoU',
         downsample_scale=8,
         pc_range=point_cloud_range,
-        #use_ensemble=True,
         modalities=dict(
             train=["fused", "bev", "img"],
-            test=["fused","bev","img"]
+            test=["fused", "bev","img"]
         ),
         common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2), iou=(1,2)),
         tasks=[
@@ -229,7 +268,6 @@ model = dict(
             type='SeparateTaskHead', init_bias=-2.19, final_kernel=1),
         transformer=dict(
             type='MOADTransformer',
-            use_cam_embed=True,
             decoder=dict(
                 type='PETRTransformerDecoder',
                 return_intermediate=True,
@@ -263,36 +301,6 @@ model = dict(
                                      'ffn', 'norm')),
             ),
         ),
-        # ensemble=dict(
-        #     type='PMETransformer',
-        #     decoder=dict(
-        #         type="PETRTransformerDecoder",
-        #         return_intermediate=True,
-        #         num_layers=1,
-        #         transformerlayers=dict(
-        #             type='PETRTransformerDecoderLayer',
-        #             with_cp=False,
-        #             attn_cfgs=[
-        #                 dict(
-        #                     type='MultiheadAttention',
-        #                     embed_dims=256,
-        #                     num_heads=8,
-        #                     dropout=0.1),
-        #             ],
-        #             ffn_cfgs=dict(
-        #                 type='FFN',
-        #                 embed_dims=256,
-        #                 feedforward_channels=1024,
-        #                 num_fcs=2,
-        #                 ffn_drop=0.,
-        #                 act_cfg=dict(type='ReLU', inplace=True),
-        #             ),
-
-        #             feedforward_channels=1024,
-        #             operation_order=('cross_attn', 'norm', 'ffn', 'norm')
-        #         ),
-        #     ),
-        # ),
         loss_cls=dict(type='FocalLoss', use_sigmoid=True, gamma=2, alpha=0.25, reduction='mean', loss_weight=2.0),
         loss_bbox=dict(type='L1Loss', reduction='mean', loss_weight=0.25)
     ),
@@ -310,7 +318,7 @@ model = dict(
             pos_weight=-1,
             gaussian_overlap=0.1,
             min_radius=2,
-            grid_size=[1440, 1440, 40],
+            grid_size=[1024, 1024, 40],  # [x_len, y_len, 1]
             voxel_size=voxel_size,
             out_size_factor=out_size_factor,
             code_weights=[2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
@@ -318,7 +326,7 @@ model = dict(
     test_cfg=dict(
         pts=dict(
             dataset='nuScenes',
-            grid_size=[1440, 1440, 40],
+            grid_size=[1024, 1024, 40],
             out_size_factor=out_size_factor,
             pc_range=point_cloud_range,
             voxel_size=voxel_size,
@@ -329,30 +337,31 @@ model = dict(
         )))
 optimizer = dict(
     type='AdamW',
-    lr=0.0001,
+    lr=0.00014,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.01, decay_mult=5),
             'img_neck': dict(lr_mult=0.1),
         }),
-    weight_decay=0.01)
+    weight_decay=0.01)  # for 8gpu * 2sample_per_gpu
 optimizer_config = dict(
     type='CustomFp16OptimizerHook',
     loss_scale='dynamic',
     grad_clip=dict(max_norm=35, norm_type=2),
+    #cumulative_iters=2,
     custom_fp16=dict(pts_voxel_encoder=False, pts_middle_encoder=False, pts_bbox_head=False))
+
 lr_config = dict(
-    policy='CosineAnnealing',
-    by_epoch=False,
-    min_lr_ratio=0.001,
-    warmup="linear",
-    warmup_iters=1000)
+    policy='cyclic',
+    target_ratio=(3, 0.0001),
+    cyclic_times=1,
+    step_ratio_up=0.4)
 momentum_config = dict(
     policy='cyclic',
     target_ratio=(0.8947368421052632, 1),
     cyclic_times=1,
     step_ratio_up=0.4)
-total_epochs = 6
+total_epochs = 20
 checkpoint_config = dict(interval=1)
 log_config = dict(
     interval=50,
@@ -361,16 +370,16 @@ log_config = dict(
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = 'work_dirs/iou_2stage/res_0100/0909_e2e_b4_lr_0.0001_delete_dn_smoothL1_sigmoid_pred'
-load_from = 'ckpts/moad_voxel0075_vov_1600x640_cbgs.pth'
+load_from = 'ckpts/nuim_r50.pth'
 resume_from = None
 workflow = [('train', 1)]
 gpu_ids = range(0, 8)
 
 custom_hooks = [
     dict(
-        type="FreezeWeight",
-        finetune_weight=["pts_bbox_head.task_heads.0.iou.0.weight", "pts_bbox_head.task_heads.0.iou.1.weight","pts_bbox_head.task_heads.0.iou.1.bias", "pts_bbox_head.task_heads.0.iou.3.weight", "pts_bbox_head.task_heads.0.iou.3.bias"]
+        type="DropGTSamplingHook",
+        priority="LOWEST",
+        pipeline_name="UnifiedObjectSample",
+        drop_epoch=15
     )
 ]
-
-find_unused_parameters = True
