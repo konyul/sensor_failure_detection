@@ -369,7 +369,8 @@ log_config = dict(
            dict(type='TensorboardLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = 'work_dirs/iou_2stage/res_0100/0909_e2e_b4_lr_0.0001_delete_dn_smoothL1_sigmoid_pred'
+# work_dir = 'work_dirs/iou_2stage/res_0100/0909_e2e_b4_lr_0.0001_delete_dn_smoothL1_sigmoid_pred_debugging'
+# load_from = 'work_dirs/iou_2stage/res_0100/0909_e2e_b4_lr_0.0001_delete_dn_smoothL1_sigmoid_pred/20240909-124809/epoch_20.pth'
 load_from = 'ckpts/nuim_r50.pth'
 resume_from = None
 workflow = [('train', 1)]

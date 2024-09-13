@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from mmdet3d.core.utils.center_utils import _transpose_and_gather_feat, \
   bbox3d_overlaps_iou, bbox3d_overlaps_giou, bbox3d_overlaps_diou
 from mmdet3d.ops.iou3d_nms.iou3d_nms_utils import boxes_aligned_iou3d_gpu ,boxes_iou_bev
-
+import matplotlib.pyplot as plt
 class RegLoss(nn.Module):
   '''Regression loss for an output tensor
     Arguments:
@@ -74,16 +74,65 @@ class IouLoss(nn.Module):
         y = torch.clamp(x.sigmoid_(), min=1e-4, max=1-1e-4)
         return y
 
-  def forward(self, iou_pred, box_pred, box_gt,num_total_pos):
+  def hist_coeff(self, pred_loc, gt_loc):
+    pred = pred_loc[gt_loc.nonzero().squeeze()]
+    gt = gt_loc[gt_loc.nonzero().squeeze()]
+    n = gt.shape[0]
+    pred = pred.detach().cpu()
+    gt = gt.detach().cpu()
+    # pred와 gt의 순위 계산
+    pred_ranks = torch.argsort(torch.argsort(pred)) + 1
+    gt_ranks = torch.argsort(torch.argsort(gt)) + 1
+
+    # 스피어만 상관계수 계산
+    spearman_corr = torch.corrcoef(torch.stack((pred_ranks.float(), gt_ranks.float())))[0, 1].item()
+
+    # 순위 차이 계산
+    rank_diff = (pred_ranks - gt_ranks).abs()
+
+    # 그래프 생성
+    plt.figure(figsize=(12, 10))
+
+    # 산점도: x축은 gt의 순위, y축은 pred의 순위
+    plt.scatter(gt_ranks.numpy(), pred_ranks.numpy(), alpha=0.6)
+    plt.plot([1, n], [1, n], color='r', linestyle='--')  # 이상적인 일치선
+
+    plt.title(f'Rank Comparison: Predicted vs Ground Truth\nSpearman Correlation: {spearman_corr:.4f}')
+    plt.xlabel('Ground Truth Rank')
+    plt.ylabel('Predicted Rank')
+
+    # 그래프 레이아웃 조정
+    plt.tight_layout()
+
+    # 그래프를 이미지 파일로 저장
+    plt.savefig('rank_comparison_plot_train.png', dpi=300, bbox_inches='tight')
+    print("순위 비교 그래프가 'rank_comparison_plot.png' 파일로 저장되었습니다.")
+
+    # 분석 결과 출력
+    print(f"스피어만 상관계수: {spearman_corr:.4f}")
+    print(f"순위 차이의 평균: {rank_diff.float().mean().item():.2f}")
+    print(f"순위 차이의 중앙값: {rank_diff.float().median().item():.2f}")
+    print(f"순위 차이의 최대값: {rank_diff.max().item()}")
+
+    # 순위 차이가 가장 큰 상위 5개 인덱스
+    top_5_diff_indices = torch.argsort(rank_diff, descending=True)[:5]
+    print("\n순위 차이가 가장 큰 상위 5개 인덱스:")
+    for idx in top_5_diff_indices:
+        print(f"인덱스 {idx.item()}: GT 순위 {gt_ranks[idx].item()}, Pred 순위 {pred_ranks[idx].item()}, 차이 {rank_diff[idx].item()}")
+
+    # plt.show()  # 필요시 주석 해제하여 그래프를 화면에 표시
+  def forward(self, iou_pred, box_pred, box_gt, num_total_pos):
     
-    #import pdb; pdb.set_trace()
-    target = boxes_iou_bev(box_pred[:,:7],box_gt[:,:7])
+    target = boxes_iou_bev(box_pred[:,:7], box_gt[:,:7])
     target = target.max(1)[0]
     
-    iou_pred= self._sigmoid(iou_pred)
-    #target = (target-0.5)/0.5
-    loss = F.smooth_l1_loss(iou_pred.squeeze(), target.squeeze(), reduction='mean')
-    loss = 5* loss
+    # iou_pred= self._sigmoid(iou_pred)
+    # self.hist_coeff(iou_pred.squeeze(), target)
+    target = 2 * target - 1
+    loss = F.l1_loss(iou_pred.squeeze(), target, reduction='sum')
+    loss = loss / (num_total_pos + 1e-4)
+    # loss = F.smooth_l1_loss(iou_pred.squeeze(), target.squeeze(), reduction='mean')
+    # loss = 5* loss
     
     #loss = F.l1_loss(iou_pred.squeeze(), target.squeeze(), reduction='sum')
     #loss = loss / (num_total_pos + 1e-4)
