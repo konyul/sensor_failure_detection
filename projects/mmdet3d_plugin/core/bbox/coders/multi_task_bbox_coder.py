@@ -197,8 +197,7 @@ class MultiTaskBBoxCoder_iou(BaseBBoxCoder):
         labels = indexs % self.num_classes
         bbox_index = indexs // self.num_classes
         task_index = torch.gather(task_ids, 1, labels.unsqueeze(1)).squeeze()
-        # iou_pred = iou_pred.sigmoid()
-        iou_pred = (iou_pred + 1) * 0.5
+        # iou_pred = (iou_pred + 1) * 0.5
         bbox_preds = bbox_preds[task_index * num_query + bbox_index]
         boxes3d = denormalize_bbox(bbox_preds, self.pc_range)
 
@@ -245,8 +244,7 @@ class MultiTaskBBoxCoder_iou(BaseBBoxCoder):
             list[dict]: Decoded boxes.
         """
         task_num = len(preds_dicts)
-
-        pred_bbox_list, pred_logits_list, pred_iou_list, task_ids_list, rv_box_mask_lists = [], [], [], [], []
+        pred_bbox_list, pred_logits_list, pred_iou_list, task_ids_list, rv_box_mask_lists, pred_uncertainty_list = [], [], [], [], [], []
         for task_id in range(task_num):
             task_pred_dict = preds_dicts[task_id][0]
             task_pred_bbox = [task_pred_dict['center'][-1], task_pred_dict['height'][-1],
@@ -255,12 +253,18 @@ class MultiTaskBBoxCoder_iou(BaseBBoxCoder):
                 task_pred_bbox.append(task_pred_dict['vel'][-1])
             if 'iou' in task_pred_dict:
                 task_pred_iou = task_pred_dict['iou'][-1]
+                pred_iou_list.append(task_pred_iou)
+                all_pred_iou = torch.cat(pred_iou_list,dim =-1)
+            if 'center_sigma' in task_pred_dict:
+                task_pred_bbox_uncertainty = torch.sum(task_pred_dict['center_sigma'][-1],dim=-1)[...,None] + task_pred_dict['height_sigma'][-1] + torch.sum(task_pred_dict['dim_sigma'][-1],dim=-1)[...,None] + torch.sum(task_pred_dict['rot_sigma'][-1],dim=-1)[...,None]
+                task_pred_bbox_uncertainty = task_pred_bbox_uncertainty / 8
+                pred_uncertainty_list.append(task_pred_bbox_uncertainty)
+                all_pred_bbox_uncertainty = torch.cat(pred_uncertainty_list,dim =-1)
                 
             task_pred_bbox = torch.cat(task_pred_bbox, dim=-1)
             task_pred_logits = task_pred_dict['cls_logits'][-1]
             pred_bbox_list.append(task_pred_bbox)
             pred_logits_list.append(task_pred_logits)
-            pred_iou_list.append(task_pred_iou)
 
             if "rv_box_mask" in task_pred_dict:
                 rv_box_mask_lists.append(task_pred_dict["rv_box_mask"])
@@ -274,7 +278,6 @@ class MultiTaskBBoxCoder_iou(BaseBBoxCoder):
 
         all_pred_logits = torch.cat(pred_logits_list, dim=-1)  # bs * nq * 10
         all_pred_bbox = torch.cat(pred_bbox_list, dim=1)  # bs * (task nq) * 10
-        all_pred_iou = torch.cat(pred_iou_list,dim =-1)
         all_task_ids = torch.cat(task_ids_list, dim=-1)  # bs * nq * 10
         all_rv_box_masks = torch.cat(rv_box_mask_lists, dim=-1)
         
@@ -289,7 +292,12 @@ class MultiTaskBBoxCoder_iou(BaseBBoxCoder):
 
             pred_logits = all_pred_logits[i][box_mask]
             pred_bbox = all_pred_bbox[i][box_mask]
-            pred_iou = all_pred_iou[i][box_mask]
+            if 'iou' in task_pred_dict:
+                pred_iou = all_pred_iou[i][box_mask]
+                pred_iou = pred_iou.sigmoid()
+            if 'center_sigma' in task_pred_dict:
+                pred_iou = all_pred_bbox_uncertainty[i][box_mask]
+                
             task_ids = all_task_ids[i][box_mask]
 
             predictions_list.append(

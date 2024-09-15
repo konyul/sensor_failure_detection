@@ -126,13 +126,11 @@ class IouLoss(nn.Module):
     target = boxes_iou_bev(box_pred[:,:7], box_gt[:,:7])
     target = target.max(1)[0]
     
-    # iou_pred= self._sigmoid(iou_pred)
+    iou_pred= self._sigmoid(iou_pred)
     # self.hist_coeff(iou_pred.squeeze(), target)
-    target = 2 * target - 1
-    loss = F.l1_loss(iou_pred.squeeze(), target, reduction='sum')
-    loss = loss / (num_total_pos + 1e-4)
-    # loss = F.smooth_l1_loss(iou_pred.squeeze(), target.squeeze(), reduction='mean')
-    # loss = 5* loss
+    # target = 2 * target - 1
+    loss = F.smooth_l1_loss(iou_pred.squeeze(), target.squeeze(), reduction='mean')
+    loss = 5* loss
     
     #loss = F.l1_loss(iou_pred.squeeze(), target.squeeze(), reduction='sum')
     #loss = loss / (num_total_pos + 1e-4)
@@ -159,7 +157,7 @@ class IouRegLoss(nn.Module):
     else:
       raise NotImplementedError
 
-  def forward(self, box_pred, box_gt):
+  def forward(self, box_pred, box_gt, num_total_pos):
     # if mask.sum() == 0:
     #   return box_pred.new_zeros((1))
     # mask = mask.bool()

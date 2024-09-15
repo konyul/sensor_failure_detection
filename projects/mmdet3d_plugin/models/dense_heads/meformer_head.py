@@ -880,6 +880,7 @@ class MEFormerHead(BaseModule):
                  dn_weight=1.0,
                  split=0.75,
                  iou_reg = None,
+                 uncertainty = False,
                  train_cfg=None,
                  test_cfg=None,
                  common_heads=dict(
@@ -942,7 +943,10 @@ class MEFormerHead(BaseModule):
         self.with_iou_reg = iou_reg is not None
         if self.with_iou:
             self.crit_iou = IouLoss()
-        self.crit_iou_reg=None
+        self.crit_iou_reg = None
+        if self.with_iou_reg:
+            self.crit_iou_reg = IouRegLoss(iou_reg)
+        self.uncertainty = uncertainty
 
         self.shared_conv = ConvModule(
             in_channels,
@@ -1215,13 +1219,21 @@ class MEFormerHead(BaseModule):
         flag = 0
         for task_id, task in enumerate(self.task_heads, 0):
             outs = task(outs_dec)
-
-            center = (outs['center'] + reference[None, :, :, :2]).sigmoid()
-            height = (outs['height'] + reference[None, :, :, 2:3]).sigmoid()
+            center = (outs['center'][...,:2] + reference[None, :, :, :2]).sigmoid()
+            height = (outs['height'][...,:1] + reference[None, :, :, 2:3]).sigmoid()
             _center, _height = center.new_zeros(center.shape), height.new_zeros(height.shape)
             _center[..., 0:1] = center[..., 0:1] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0]
             _center[..., 1:2] = center[..., 1:2] * (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1]
             _height[..., 0:1] = height[..., 0:1] * (self.pc_range[5] - self.pc_range[2]) + self.pc_range[2]
+            if self.uncertainty:
+                outs['center_sigma'] = outs['center'][...,2:].sigmoid()
+                outs['height_sigma'] = outs['height'][...,1:].sigmoid()
+                outs['dim_sigma'] = outs['dim'][...,3:].sigmoid()
+                outs['rot_sigma'] = outs['rot'][...,2:].sigmoid()
+                outs['vel_sigma'] = outs['vel'][...,2:].sigmoid()
+                outs['dim'] = outs['dim'][...,:3]
+                outs['rot'] = outs['rot'][...,:2]
+                outs['vel'] = outs['vel'][...,:2]
             outs['center'] = _center
             outs['height'] = _height
             if self.failure_pred:
@@ -1422,10 +1434,15 @@ class MEFormerHead(BaseModule):
         return (task_labels_list, task_labels_weight_list, task_bbox_targets_list,
                 task_bbox_weights_list, num_total_pos_tasks, num_total_neg_tasks)
 
+    def _gaussian_dist_pdf(self, val, mean, weight, var, avg_factor):
+        #return torch.exp(- (val - mean) ** 2.0 / var / 2.0) / torch.sqrt(2.0 * np.pi * var) * (weight) / (avg_factor)
+        return torch.exp(- (val - mean) ** 2.0 / var / 2.0) / torch.sqrt(2.0 * np.pi * var) * (weight) / (avg_factor) * 1000
+
     def _loss_single_task(self,
                           pred_bboxes,
                           pred_logits,
                           pred_ious,
+                          pred_bboxes_uncertainty,
                           labels_list,
                           labels_weights_list,
                           bbox_targets_list,
@@ -1454,7 +1471,12 @@ class MEFormerHead(BaseModule):
 
         pred_bboxes_flatten = pred_bboxes.flatten(0, 1)
         pred_logits_flatten = pred_logits.flatten(0, 1)
-        pred_ious_flatten = pred_ious.flatten(0,1)
+        if pred_ious:
+            pred_ious_flatten = pred_ious.flatten(0,1)
+        if self.uncertainty:
+            pred_bboxes_uncertainty_flatten = pred_bboxes_uncertainty.flatten(0,1)
+        else:
+            pred_bboxes_uncertainty_flatten = False
 
         cls_avg_factor = num_total_pos * 1.0 + num_total_neg * 0.1
         cls_avg_factor = max(cls_avg_factor, 1)
@@ -1465,29 +1487,44 @@ class MEFormerHead(BaseModule):
         normalized_bbox_targets = normalize_bbox(bbox_targets, self.pc_range)
         isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
         bbox_weights = bbox_weights * bbox_weights.new_tensor(self.train_cfg.code_weights)[None, :]
-
-        loss_bbox = self.loss_bbox(
-            pred_bboxes_flatten[isnotnan, :10],
-            normalized_bbox_targets[isnotnan, :10],
-            bbox_weights[isnotnan, :10],
-            avg_factor=num_total_pos
-        )
+        
+        if self.uncertainty:
+            loss_bbox = self._gaussian_dist_pdf(pred_bboxes_flatten[isnotnan, :10], 
+                normalized_bbox_targets[isnotnan, :10], 
+                bbox_weights[isnotnan, :10],
+                pred_bboxes_uncertainty_flatten[isnotnan, :10],
+                avg_factor=num_total_pos)
+        else:
+            loss_bbox = self.loss_bbox(
+                pred_bboxes_flatten[isnotnan, :10],
+                normalized_bbox_targets[isnotnan, :10],
+                bbox_weights[isnotnan, :10],
+                avg_factor=num_total_pos
+            )
         #invalid_indices = torch.nonzero(~isnotnan).squeeze(1)
         
         if self.with_iou:
             denormal_pred = denormalize_bbox(pred_bboxes_flatten,self.pc_range)
             pred_bboxes_flatten_for_iou = denormal_pred[isnotnan,:10].detach()
             iou_loss= self.crit_iou(pred_ious_flatten[isnotnan], pred_bboxes_flatten_for_iou, bbox_targets[isnotnan,:10],num_total_pos)
-        
+        else:
+            iou_loss = torch.tensor([0.0]).cuda()
+        if self.crit_iou_reg:
+            iou_reg_loss = self.crit_iou_reg(pred_bboxes_flatten_for_iou, bbox_targets[isnotnan,:10], num_total_pos)
+            iou_reg_loss = iou_reg_loss * 0.25
+        else:
+            iou_reg_loss = torch.tensor([0.0]).cuda()
         iou_loss = torch.nan_to_num(iou_loss)
+        iou_reg_loss = torch.nan_to_num(iou_reg_loss)
         loss_cls = torch.nan_to_num(loss_cls)
         loss_bbox = torch.nan_to_num(loss_bbox)
-        return loss_cls, loss_bbox , iou_loss
+        return loss_cls, loss_bbox , iou_loss, iou_reg_loss
 
     def loss_single(self,
                     pred_bboxes,
                     pred_logits,
                     pred_ious,
+                    pred_bboxes_uncertainty,
                     gt_bboxes_3d,
                     gt_labels_3d):
         """"Loss function for outputs from a single decoder layer of a single
@@ -1502,21 +1539,21 @@ class MEFormerHead(BaseModule):
                 a single decoder layer.
         """
         batch_size = pred_bboxes[0].shape[0]
-        pred_bboxes_list, pred_logits_list,pred_ious_list = [], [] ,[]
+        pred_bboxes_list, pred_logits_list = [], []
         for idx in range(batch_size):
             pred_bboxes_list.append([task_pred_bbox[idx] for task_pred_bbox in pred_bboxes])
             pred_logits_list.append([task_pred_logits[idx] for task_pred_logits in pred_logits])
-            pred_ious_list.append([task_pred_iou[idx] for task_pred_iou in pred_ious])
         cls_reg_targets = self.get_targets(
             gt_bboxes_3d, gt_labels_3d, pred_bboxes_list, pred_logits_list
         )
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
-        loss_cls_tasks, loss_bbox_tasks ,loss_iou_tasks= multi_apply(
+        loss_cls_tasks, loss_bbox_tasks, loss_iou_tasks, loss_iou_reg_tasks= multi_apply(
             self._loss_single_task,
             pred_bboxes,
             pred_logits,
             pred_ious,
+            pred_bboxes_uncertainty,
             labels_list,
             label_weights_list,
             bbox_targets_list,
@@ -1525,7 +1562,7 @@ class MEFormerHead(BaseModule):
             num_total_neg
         )
 
-        return sum(loss_cls_tasks), sum(loss_bbox_tasks) , sum(loss_iou_tasks)
+        return sum(loss_cls_tasks), sum(loss_bbox_tasks), sum(loss_iou_tasks), sum(loss_iou_reg_tasks)
 
     def _dn_loss_single_task(self,
                              pred_bboxes,
@@ -1609,42 +1646,56 @@ class MEFormerHead(BaseModule):
         loss_dict = dict()
         for i, modality in enumerate(preds_dicts[0][0]["modalities"]):
             num_decoder = preds_dicts[0][0]['center'][i].shape[0]
-            #import pdb;pdb.set_trace()
-            all_pred_bboxes, all_pred_logits , all_pred_ious = collections.defaultdict(list), collections.defaultdict(list) , collections.defaultdict(list)
+            all_pred_bboxes, all_pred_logits, all_pred_ious, all_pred_bboxes_uncertainty = collections.defaultdict(list), collections.defaultdict(list), collections.defaultdict(list), collections.defaultdict(list)
 
             for task_id, preds_dict in enumerate(preds_dicts, 0):
                 for dec_id in range(num_decoder):
                     pred_bbox = [preds_dict[0]['center'][i][dec_id], preds_dict[0]['height'][i][dec_id],
-                                 preds_dict[0]['dim'][i][dec_id], preds_dict[0]['rot'][i][dec_id]]
+                                preds_dict[0]['dim'][i][dec_id], preds_dict[0]['rot'][i][dec_id]]
                     if 'vel' in preds_dict[0]:
                         pred_bbox.append(preds_dict[0]['vel'][i][dec_id])
                     if 'iou' in preds_dict[0]:
                         pred_iou = preds_dict[0]['iou'][i][dec_id]
+                        all_pred_ious[dec_id].append(pred_iou)
+                        all_pred_ious = [all_pred_ious[idx] for idx in range(num_decoder)]
+                    else:
+                        all_pred_ious = [[False] for idx in range(num_decoder)]
+                    if self.uncertainty:
+                        pred_bbox_uncertainty = [preds_dict[0]['center_sigma'][i][dec_id], preds_dict[0]['height_sigma'][i][dec_id],
+                                preds_dict[0]['dim_sigma'][i][dec_id], preds_dict[0]['rot_sigma'][i][dec_id], preds_dict[0]['vel_sigma'][i][dec_id]]
+                        pred_bbox_uncertainty = torch.cat(pred_bbox_uncertainty, dim=-1)
+                        all_pred_bboxes_uncertainty[dec_id].append(pred_bbox_uncertainty)
+                        all_pred_bboxes_uncertainty   \
+                                        = [all_pred_bboxes_uncertainty[idx] for idx in range(num_decoder)]
+                    else:
+                        all_pred_bboxes_uncertainty = [[False] for idx in range(num_decoder)]
+                        
                     pred_bbox = torch.cat(pred_bbox, dim=-1)
-
-                    all_pred_ious[dec_id].append(pred_iou)
                     all_pred_bboxes[dec_id].append(pred_bbox)
                     all_pred_logits[dec_id].append(preds_dict[0]['cls_logits'][i][dec_id])
             all_pred_bboxes = [all_pred_bboxes[idx] for idx in range(num_decoder)]
             all_pred_logits = [all_pred_logits[idx] for idx in range(num_decoder)]
-            all_pred_ious   = [all_pred_ious[idx] for idx in range(num_decoder)]
-
-            loss_cls, loss_bbox ,loss_iou = multi_apply(
-                self.loss_single, all_pred_bboxes, all_pred_logits, all_pred_ious,
+            
+            loss_cls, loss_bbox, loss_iou, loss_iou_reg = multi_apply(
+                self.loss_single, all_pred_bboxes, all_pred_logits, all_pred_ious, all_pred_bboxes_uncertainty,
                 [gt_bboxes_3d for _ in range(num_decoder)],
                 [gt_labels_3d for _ in range(num_decoder)],
             )
+                
 
             loss_dict[f'loss_cls_{modality}'] = loss_cls[-1]
             loss_dict[f'loss_bbox_{modality}'] = loss_bbox[-1]
             loss_dict[f'loss_iou_{modality}'] = loss_iou[-1]
+            loss_dict[f'loss_iou_reg_{modality}'] = loss_iou_reg[-1]
 
             num_dec_layer = 0
-            for loss_cls_i, loss_bbox_i , loss_iou_i in zip(loss_cls[:-1],
-                                               loss_bbox[:-1], loss_iou[:-1]):
+            for loss_cls_i, loss_bbox_i , loss_iou_i, loss_iou_reg_i in zip(loss_cls[:-1],
+                                               loss_bbox[:-1], loss_iou[:-1], loss_iou_reg[:-1]):
                 loss_dict[f'd{num_dec_layer}.loss_cls_{modality}'] = loss_cls_i
                 loss_dict[f'd{num_dec_layer}.loss_bbox_{modality}'] = loss_bbox_i
                 loss_dict[f'd{num_dec_layer}.loss_iou_{modality}'] = loss_iou_i
+                loss_dict[f'd{num_dec_layer}.loss_iou_reg_{modality}'] = loss_iou_reg_i
+                
                 num_dec_layer += 1
 
             dn_pred_bboxes, dn_pred_logits = collections.defaultdict(list), collections.defaultdict(list)

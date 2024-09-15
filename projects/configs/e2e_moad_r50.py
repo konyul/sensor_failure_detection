@@ -241,14 +241,15 @@ model = dict(
         type='MEFormerHead',
         in_channels=512,
         hidden_dim=256,
-        iou_reg='DIoU',
+        iou_reg=None,
+        uncertainty=True,
         downsample_scale=8,
         pc_range=point_cloud_range,
         modalities=dict(
             train=["fused", "bev", "img"],
             test=["fused", "bev","img"]
         ),
-        common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2), iou=(1,2)),
+        common_heads=dict(center=(4, 2), height=(2, 2), dim=(6, 2), rot=(4, 2), vel=(4, 2)),
         tasks=[
             dict(num_class=10, class_names=[
                 'car', 'truck', 'construction_vehicle',
