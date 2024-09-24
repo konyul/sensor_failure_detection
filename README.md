@@ -32,7 +32,7 @@ docker exec -it ${컨테이너명} /bin/bash
 cd mmdetection3d
 pip install -v -e.
 cd ..
-pip install -v -e.
+pip install -r requirements.txt
 ```
 
 데이터 생성
